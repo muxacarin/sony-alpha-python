@@ -6,13 +6,15 @@ import time
 import threading
 import logging
 import random
+import struct
+import asyncio
 from threading import Timer
 from typing import Optional
 
 from .protocol import (
     PTP_STATES, PTPIP_INIT_COMMAND_ACK, PTPIP_INIT_EVENT_ACK, PTPIP_OPER_RESP,
     PTPIP_PROBE_REQ, PTPIP_PROBE_RESP, PTPIP_START_DATA, PTPIP_DATA, PTPIP_END_DATA,
-    PTPIP_EVENT, PTP_OPERATIONS, PTP_RESPONSES,
+    PTPIP_EVENT, PTP_OPERATIONS, PTP_RESPONSES, SONY_PROPERTIES,
     create_init_cmd_req_packet, create_init_event_req_packet, create_operation_request,
     create_probe_resp, create_probe_req, parse_packet_header, parse_init_cmd_ack,
     parse_operation_response
@@ -102,7 +104,7 @@ class SonyCamera:
         if self.connected:
             return True
         
-        logging.info('🔗 Connecting to Sony Alpha camera...')
+        #logging.info('🔗 Connecting to Sony Alpha camera...')
         
         try:
             # Establish connection (SSH tunnel + sockets)
@@ -382,7 +384,30 @@ class SonyCamera:
                 self.sdio_ready = True
                 
                 try:
-                    send_operation_sync(PTP_OPERATIONS['SONY_GET_ALL_DEVICE_PROP_DATA'], [])
+                    # Get all device properties - this also initializes our recording state cache
+                    response = send_operation_sync(PTP_OPERATIONS['SONY_GET_ALL_DEVICE_PROP_DATA'], [])
+                    
+                    # Try to extract initial recording state from the properties
+                    if response and len(response) > 100:
+                        try:
+                            recording_prop = SONY_PROPERTIES['RECORDING_STATE']  # 0xD21D
+                            recording_bytes = struct.pack('<H', recording_prop)
+                            
+                            # Search for recording state property
+                            for offset in range(0, len(response) - 16):
+                                if response[offset:offset+2] == recording_bytes:
+                                    # Found it! Extract the value (offset +8)
+                                    value_offset = offset + 8
+                                    if value_offset + 4 <= len(response):
+                                        rec_state = struct.unpack('<I', response[value_offset:value_offset+4])[0]
+                                        # Cache the initial recording state (emit event for managers to catch)
+                                        is_recording = (rec_state == 1)
+                                        logging.info(f"📹 Initial recording state: {'Recording' if is_recording else 'Stopped'}")
+                                        self.emit('recording_state_detected', is_recording)
+                                    break
+                        except Exception as e:
+                            logging.debug(f"Could not extract initial recording state: {e}")
+                    
                     logging.info('✅ Camera fully ready!')
                 except Exception as e:
                     logging.warning(f'Device properties failed: {e}')
@@ -479,17 +504,200 @@ class SonyCamera:
         """Stop continuous zoom"""
         return await self.zoom.stop_zoom()
     
-    async def disconnect(self):
-        """Disconnect from camera"""
-        self._stop_task_loop()
-        self._stop_keepalive()
+    async def _send_operation_and_wait(self, op_code: int, params: bytes = None, timeout: float = 2.0):
+        """Send PTP operation and wait for response"""
+        if not self.connection.command_socket:
+            raise Exception('Command socket not available')
         
-        # Stop zoom tracking
-        if hasattr(self.zoom, '_zoom_tracking_interval') and self.zoom._zoom_tracking_interval:
-            self.zoom._zoom_tracking_interval.cancel()
+        # Get current transaction ID and increment
+        tx_id = self.transaction_id
+        self.transaction_id += 1
         
-        await self.connection.disconnect()
+        # Create operation request packet
+        if params:
+            if len(params) == 2:  # Single 16-bit parameter
+                param_list = [struct.unpack('<H', params)[0]]
+                logging.info(f"🔧 Single param: 0x{param_list[0]:04X}")
+            elif len(params) == 8:  # Two 32-bit parameters
+                param1, param2 = struct.unpack('<II', params)
+                param_list = [param1, param2]
+                logging.info(f"🔧 Two params: 0x{param1:08X}, 0x{param2:08X}")
+            else:
+                param_list = []
+                logging.info(f"🔧 Unknown param length: {len(params)}")
+        else:
+            param_list = []
+            logging.info("🔧 No parameters")
+            
+        packet = create_operation_request(op_code, tx_id, param_list)
+        #logging.info(f"🔧 Created packet: {len(packet)} bytes, tx_id={tx_id}")
         
-        self.connected = False
-        self.state = PTP_STATES.INIT
-        logging.info('Disconnected from camera')
+        try:
+            # Send operation request
+            self.connection.command_socket.send(packet)
+            #logging.info(f"🔧 Sent operation request")
+            
+            # Wait for response with timeout
+            start_time = time.time()
+            response_count = 0
+            while time.time() - start_time < timeout:
+                try:
+                    data = self.connection.command_socket.recv(4096)
+                    if data:
+                        response_count += 1
+                        #logging.info(f"🔧 Received response #{response_count}: {len(data)} bytes")
+                        
+                        # Parse response - look for operation response
+                        try:
+                            length, pkt_type = parse_packet_header(data)
+                            payload = data[8:]  # Payload starts after 8-byte header
+                            #logging.info(f"🔧 Packet type: 0x{pkt_type:08X} (expecting 0x{PTPIP_OPER_RESP:08X}), length: {length}, payload: {len(payload)} bytes")
+                        except Exception as parse_error:
+                            logging.error(f"🔧 Failed to parse packet header: {parse_error}")
+                            #logging.info(f"🔧 Raw packet data: {data[:50].hex()}...")
+                            continue
+                        
+                        if pkt_type == PTPIP_OPER_RESP:
+                            #logging.info(f"🔧 Found operation response!")
+                            # Extract response data (skip header)
+                            if len(payload) > 8:  # Response code + transaction ID
+                                result = payload[8:]
+                                #logging.info(f"🔧 Returning {len(result)} bytes of data")
+                                return result
+                            else:
+                                logging.info(f"🔧 Empty response payload")
+                                return b''
+                        elif pkt_type == PTPIP_START_DATA:
+                            logging.info(f"🔧 Got START_DATA packet - collecting all data...")
+                            # START_DATA is just the beginning, we need to collect more packets
+                            all_data = b''
+                            
+                            # Add initial data from START_DATA
+                            if len(payload) >= 12:
+                                all_data += payload[12:]
+                                #logging.info(f"🔧 START_DATA initial data: {len(payload[12:])} bytes")
+                            elif len(payload) >= 8:
+                                all_data += payload[8:]
+                                #logging.info(f"🔧 START_DATA initial data: {len(payload[8:])} bytes")
+                            else:
+                                all_data += payload
+                                #logging.info(f"🔧 START_DATA initial data: {len(payload)} bytes")
+                            
+                            # Continue collecting until we have substantial data or timeout
+                            while time.time() - start_time < timeout and len(all_data) < 1000:
+                                try:
+                                    more_data = self.connection.command_socket.recv(4096)
+                                    if more_data:
+                                        response_count += 1
+                                        #logging.info(f"🔧 Received response #{response_count}: {len(more_data)} bytes")
+                                        
+                                        # Try to parse the packet
+                                        try:
+                                            more_length, more_pkt_type = parse_packet_header(more_data)
+                                            more_payload = more_data[8:]
+                                            #logging.info(f"🔧 Additional packet type: 0x{more_pkt_type:08X}, payload: {len(more_payload)} bytes")
+                                            
+                                            # Collect data from any packet type that has substantial payload
+                                            if len(more_payload) > 100:  # Only collect substantial data
+                                                all_data += more_payload
+                                                #logging.info(f"🔧 Added {len(more_payload)} bytes, total: {len(all_data)} bytes")
+                                                
+                                        except:
+                                            # If we can't parse the header, just use the raw data
+                                            if len(more_data) > 100:
+                                                all_data += more_data[8:]  # Skip potential header
+                                                #logging.info(f"🔧 Added raw data: {len(more_data[8:])} bytes, total: {len(all_data)} bytes")
+                                    
+                                except Exception as e:
+                                    logging.debug(f"🔧 Error collecting additional data: {e}")
+                                    break
+                                    
+                                await asyncio.sleep(0.01)
+                            
+                            #logging.info(f"🔧 Final collected data: {len(all_data)} bytes")
+                            return all_data if len(all_data) > 10 else None
+                        elif pkt_type == PTPIP_DATA:
+                            #logging.info(f"🔧 Got standalone DATA packet - collecting data")
+                            result = payload
+                            #logging.info(f"🔧 Using DATA payload: {len(result)} bytes")
+                            return result
+                        else:
+                            logging.info(f"🔧 Unknown packet type, continuing...")
+                except Exception as e:
+                    logging.debug(f"🔧 Socket recv error: {e}")
+                    pass
+                await asyncio.sleep(0.01)
+            
+            logging.info(f"🔧 Timeout after {timeout}s, received {response_count} responses")
+            return None
+            
+        except Exception as e:
+            logging.error(f'Failed to send operation 0x{op_code:04X}: {e}')
+            raise
+    
+    async def get_zoom_bar_info(self):
+        """Get current zoom bar information"""
+        try:
+            if not self.is_ready():
+                logging.info("Camera not ready for zoom bar query")
+                return None
+            
+            logging.info("🔍 Querying zoom bar info...")
+            
+            # Use SDIO_GetAllExtDevicePropInfo to get all device properties
+            op_code = PTP_OPERATIONS['SONY_GET_ALL_DEVICE_PROP_DATA']  # 0x9209
+            # Parameter 1: Flag of get only difference data (0x00000000 = get all data)
+            # Parameter 2: Flag of Device Property Option (0x00000001 = enable extended properties)
+            params = struct.pack('<II', 0x00000000, 0x00000001)
+            
+            #logging.info(f"📡 Sending all device properties query: op_code=0x{op_code:04X} with extended properties flag")
+            
+            response_data = await self._send_operation_and_wait(op_code, params)
+            
+            #logging.info(f"📊 Zoom bar response: {response_data.hex() if response_data else 'None'} (length: {len(response_data) if response_data else 0})")
+            
+            if response_data and len(response_data) >= 8:
+                # Log basic info about the response
+                #logging.info(f"📋 Got device properties data: {len(response_data)} bytes")
+                
+                try:
+                    # The Sony format might not start with a count - let's search for the zoom property directly
+                    zoom_property = SONY_PROPERTIES['ZOOM_BAR_INFO']  # 0xD25D
+                    
+                    # Search for the property code in little-endian format
+                    zoom_property_bytes = struct.pack('<H', zoom_property)  # 0x5DD2 in little-endian
+                    
+                    #logging.info(f"🔍 Searching for zoom property bytes: {zoom_property_bytes.hex()}")
+                    
+                    # Find the property in the data
+                    for offset in range(0, len(response_data) - 10, 2):  # Step by 2 bytes
+                        if response_data[offset:offset+2] == zoom_property_bytes:
+                            #logging.info(f"🎯 Found zoom property 0x{zoom_property:04X} at offset {offset}")
+                            
+                            # Try to extract the current value - it should be a few bytes after the property code
+                            # Sony format: PropertyCode(2) + DataType(2) + GetSet(1) + IsEnabled(1) + FactoryDefault(var) + CurrentValue(var)
+                            
+                            # Skip property code (2 bytes) and look for the current value
+                            # Try different offsets to find the 4-byte zoom value
+                            for value_offset in [6, 8, 10, 12, 14, 16]:
+                                if offset + value_offset + 4 <= len(response_data):
+                                    zoom_value = struct.unpack('<I', response_data[offset + value_offset:offset + value_offset + 4])[0]
+                                    
+                                    # Extract components according to Sony documentation
+                                    total_boxes = (zoom_value >> 24) & 0xFF      # Bits 31-24
+                                    current_box = (zoom_value >> 16) & 0xFF      # Bits 23-16  
+                                    position_in_box = zoom_value & 0xFFFF        # Bits 15-0
+                                    
+                                    # Check if this looks like valid zoom data
+                                    if total_boxes > 0 and total_boxes <= 255 and current_box <= total_boxes:
+                                        #logging.info(f"🎯 Found valid zoom data at offset {offset + value_offset}: Raw=0x{zoom_value:08X}")
+                                        #logging.info(f"🎯 Parsed - Total boxes: {total_boxes}, Current box: {current_box}, Position: {position_in_box}")
+                                        
+                                        return {
+                                            'total_boxes': total_boxes,
+                                            'current_box': current_box,
+                                            'position_in_box': position_in_box,
+                                            'raw_value': zoom_value
+                                        }
+                            
+                            # If we found the property but couldn't parse valid data
