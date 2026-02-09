@@ -79,6 +79,13 @@ SONY_PROPERTIES = {
     'REMOTE_TOUCH_ENABLE': 0xD284,       # Remote Touch Operation Enable Status - UINT8, Get only (0x00=Disable, 0x01=Enable)
     'REMOTE_TOUCH_CANCEL_ENABLE': 0xD285,# Cancel Remote Touch Operation Enable Status - UINT8, Get only
     'TOUCH_FUNCTION': 0xD283,            # Function of Touch Operation - UINT8, Get/Set
+    # Storage / recording time remaining
+    'MEDIA_SLOT1_REC_TIME': 0xD24A,      # Media SLOT1 remaining recording time (seconds) - UINT32
+    'MEDIA_SLOT2_REC_TIME': 0xD258,      # Media SLOT2 remaining recording time (seconds) - UINT32
+    # Battery
+    'BATTERY_REMAINING': 0xD218,         # Battery remaining % - INT8 (0x64=100%, 0xFF=untaken)
+    # Exposure metering
+    'METERED_MANUAL_LEVEL': 0xD1B5,     # Metered manual level - INT16 (value * 1000)
 }
 
 # --- Value Enums ---

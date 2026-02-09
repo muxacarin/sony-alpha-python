@@ -1288,6 +1288,9 @@ class SonyCamera:
             'touch_function': empty(), 'remote_touch_enable': empty(),
             'remote_touch_cancel_enable': empty(),
             'zoom_setting': empty(), 'zoom_type_status': empty(),
+            'media_slot1_rec_time': empty(), 'media_slot2_rec_time': empty(),
+            'battery_remaining': empty(),
+            'metered_manual_level': empty(),
         }
 
         if not self.is_ready() or not self.sdio_ready:
@@ -1350,6 +1353,10 @@ class SonyCamera:
                 SONY_PROPERTIES['REMOTE_TOUCH_CANCEL_ENABLE']: 'remote_touch_cancel_enable',
                 SONY_PROPERTIES['ZOOM_SETTING']: 'zoom_setting',
                 SONY_PROPERTIES['ZOOM_TYPE_STATUS']: 'zoom_type_status',
+                SONY_PROPERTIES['MEDIA_SLOT1_REC_TIME']: 'media_slot1_rec_time',
+                SONY_PROPERTIES['MEDIA_SLOT2_REC_TIME']: 'media_slot2_rec_time',
+                SONY_PROPERTIES['BATTERY_REMAINING']: 'battery_remaining',
+                SONY_PROPERTIES['METERED_MANUAL_LEVEL']: 'metered_manual_level',
             }
 
             props = dict(default_result)
@@ -1438,6 +1445,37 @@ class SonyCamera:
                     display = format_shutter_angle(current_value)
                 elif prop_code == SONY_PROPERTIES['ISO']:
                     display = format_iso(current_value)
+                elif prop_code == SONY_PROPERTIES['BATTERY_REMAINING']:
+                    # INT8: 0xFF = untaken/no battery, otherwise percentage
+                    if current_value == 0xFF or current_value == 0:
+                        display = '--'
+                    else:
+                        display = f'{current_value}%'
+                elif prop_code == SONY_PROPERTIES['METERED_MANUAL_LEVEL']:
+                    # INT16 signed: value * 1000 = EV
+                    signed = current_value if current_value < 0x8000 else current_value - 0x10000
+                    ev = signed / 1000.0
+                    display_value = ev
+                    if ev > 0:
+                        display = f'+{ev:.1f}'
+                    elif ev < 0:
+                        display = f'{ev:.1f}'
+                    else:
+                        display = '0.0'
+                elif prop_code in (SONY_PROPERTIES['MEDIA_SLOT1_REC_TIME'],
+                                   SONY_PROPERTIES['MEDIA_SLOT2_REC_TIME']):
+                    secs = current_value
+                    if secs == 0 or secs == 0xFFFFFFFF:
+                        display = '--'
+                    elif secs >= 3600:
+                        h = secs // 3600
+                        m = (secs % 3600) // 60
+                        display = f'{h}h{m}m'
+                    elif secs >= 60:
+                        m = secs // 60
+                        display = f'{m}m'
+                    else:
+                        display = f'{secs}s'
                 elif prop_code in self._ENUM_TABLES:
                     display = self._ENUM_TABLES[prop_code].get(
                         display_value,
@@ -1447,14 +1485,14 @@ class SonyCamera:
                     display = str(display_value) if display_value != current_value else str(current_value)
 
                 props[name] = {
-                    'raw': current_value,
+                    'raw': display_value,
                     'display': display,
                     'allowed': allowed,
                     'enabled': bool(is_enabled),
                     'settable': get_set == 0x01,
                 }
 
-                logging.debug(f"  Found 0x{prop_code:04X} ({name}): val=0x{current_value:08X} "
+                logging.debug(f"  Found 0x{prop_code:04X} ({name}): val={current_value} "
                               f"display={display} get_set={get_set} enabled={is_enabled}")
 
             return props
