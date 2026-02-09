@@ -701,3 +701,15 @@ class SonyCamera:
                                         }
                             
                             # If we found the property but couldn't parse valid data
+                            logging.debug("Found zoom property but couldn't parse valid data")
+                            return None
+
+                except Exception as e:
+                    logging.debug(f"Error parsing zoom bar data: {e}")
+                    return None
+
+            return None
+
+        except Exception as e:
+            logging.debug(f"Failed to get zoom bar info: {e}")
+            return None
