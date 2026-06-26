@@ -11,6 +11,8 @@ import time
 from threading import Timer
 from typing import Optional
 
+from event_handler import EventHandler
+
 from .connection import ConnectionManager
 from .protocol import (
     EXPOSURE_PROGRAM_VALUES,
@@ -51,7 +53,7 @@ from .protocol import (
 from .zoom import ZoomController
 
 
-class SonyCamera:
+class SonyCamera(EventHandler):
     """Sony Camera PTP-IP client with task loop"""
 
     def __init__(
@@ -104,32 +106,6 @@ class SonyCamera:
     def _generate_guid(self) -> bytes:
         """Generate a 16-byte GUID for camera pairing"""
         return bytes([random.randint(0, 255) for _ in range(16)])
-
-    # Event System
-    def emit(self, event: str, *args):
-        """Emit event to handlers"""
-        if event in self._event_handlers:
-            for handler in self._event_handlers[event][:]:
-                try:
-                    handler(*args)
-                except Exception as e:
-                    logging.debug(f"Event handler error: {e}")
-
-    def on(self, event: str, handler):
-        """Add event handler"""
-        if event not in self._event_handlers:
-            self._event_handlers[event] = []
-        self._event_handlers[event].append(handler)
-
-    def once(self, event: str, handler):
-        """Add one-time event handler"""
-
-        def wrapper(*args):
-            handler(*args)
-            if event in self._event_handlers and wrapper in self._event_handlers[event]:
-                self._event_handlers[event].remove(wrapper)
-
-        self.on(event, wrapper)
 
     # Connection Management
     async def disconnect(self):
