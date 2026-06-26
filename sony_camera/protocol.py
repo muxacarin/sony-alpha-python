@@ -349,7 +349,7 @@ def create_operation_with_data_packets(
     offset += 4
     struct.pack_into("<I", packet, offset, PTPIP_OPER_REQ)
     offset += 4
-    struct.pack_into("<I", packet, offset, 1)  # Data Phase
+    struct.pack_into("<I", packet, offset, 0x2)  # Data Phase
     offset += 4
     struct.pack_into("<H", packet, offset, op_code)
     offset += 2
